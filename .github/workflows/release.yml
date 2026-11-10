@@ -1,0 +1,54 @@
+# 무설치(포터블) 버전 빌드 → GitHub 릴리즈에 zip 자동 첨부
+#  - 릴리즈를 '게시(Publish)'하면 자동 실행되어 NEIS_Attendance_RPA_<태그>.zip 을 그 릴리즈에 올림
+#  - Actions 탭에서 수동 실행(Run workflow)하면 Artifacts 로만 올림(시험용)
+name: Build & Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # 릴리즈에 파일을 올리기 위한 권한
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: python -m pip install -r requirements.txt
+
+      # --onedir : 폴더형(실행 시 임시 폴더 압축 해제 없음 → 보안 프로그램 충돌 감소)
+      # --noupx  : 실행 파일 압축 안 함(백신 오탐 방지)
+      - name: Build
+        run: python -m PyInstaller --noconfirm --onedir --noupx --windowed --name NEIS_Attendance_RPA --collect-all playwright neis_attendance_rpa.py
+
+      - name: Add guide and template
+        shell: pwsh
+        run: |
+          Copy-Item USAGE_KO.txt dist/NEIS_Attendance_RPA/
+          if (Test-Path sample_template.xlsx) { Copy-Item sample_template.xlsx dist/NEIS_Attendance_RPA/ }
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/NEIS_Attendance_RPA -DestinationPath "NEIS_Attendance_RPA_${{ github.event.release.tag_name || 'test' }}.zip"
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "NEIS_Attendance_RPA_${{ github.event.release.tag_name }}.zip" --clobber
+
+      - name: Upload artifact (manual run)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v6
+        with:
+          name: NEIS_Attendance_RPA_test
+          path: NEIS_Attendance_RPA_test.zip
