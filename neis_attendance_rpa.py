@@ -46,7 +46,7 @@ from playwright.sync_api import sync_playwright, Error as PWError
 # 0. 기본 설정값 (필요 시 여기만 조정)
 # =====================================================================
 APP_TITLE = "나이스 출결 자동 입력기"
-APP_VERSION = "v2.1 (CSV 지원)"     # 로그 첫 줄에 표시 → 어떤 버전으로 실행했는지 확인용
+APP_VERSION = "v2.2 (담임확인서 양식)"     # 로그 첫 줄에 표시 → 어떤 버전으로 실행했는지 확인용
 DEFAULT_PORT = 9222
 DEFAULT_URL = "https://gne.eduptl.kr/bpm_lgn_lg00_001.do"   # 프로그램 시작 시 기본 나이스 주소
 # 원격 제어용 브라우저 프로필 폴더 (브라우저별로 따로 사용)
@@ -137,6 +137,7 @@ HEADER_KEYS = {
     "교시": "period",
     "상태분류": "category",
     "시스템등록일시": "sysdt", "등록일시": "sysdt",
+    "비고": "note",
 }
 # 상태분류 → 기대되는 종류 (출결구분 해석과 맞는지 확인용)
 CATEGORY_EXPECT = {"결석류": "결석", "지각류": "지각", "조퇴류": "조퇴", "결과류": "결과"}
@@ -331,7 +332,37 @@ def read_attendance_excel(path: str, default_year: int) -> List[Record]:
         wb = csv_to_workbook(path)          # CSV는 메모리 안에서 엑셀 시트로 바꿔서 같은 방식으로 읽음
     else:
         wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb.active
+
+    def find_header(sheet):
+        """시트에서 날짜(일자)/번호(학번)/출결(출결구분)이 모두 있는 머리글 행 찾기 → (행, 열매핑)."""
+        for r in range(1, min(sheet.max_row, 50) + 1):
+            cm = {}
+            for c in range(1, min(sheet.max_column, 40) + 1):
+                h = norm(sheet.cell(r, c).value)
+                key = HEADER_KEYS.get(h)
+                if not key and h and len(h) <= 10:          # '해당교시', '결석사유' 같은 머리글도 인식
+                    if "교시" in h:
+                        key = "period"
+                    elif "사유" in h:
+                        key = "reason"
+                if key and key not in cm:
+                    cm[key] = c
+            if {"date", "num", "status"} <= cm.keys():
+                return r, cm
+        return None, {}
+
+    # 시트가 여러 개면(예: 출결 확인서 / 학생별요약 / 목록 / 좌석배정) 출결 머리글이 있는 시트를 자동 선택
+    #   우선순위: 현재 선택된 시트 → 이름에 '출결'·'확인서'가 들어간 시트 → 나머지
+    sheets = [wb.active] + sorted([w for w in wb.worksheets if w is not wb.active],
+                                  key=lambda w: 0 if ("출결" in w.title or "확인서" in w.title) else 1)
+    ws, header_row, colmap = None, None, {}
+    for sh in sheets:
+        hr, cm = find_header(sh)
+        if hr:
+            ws, header_row, colmap = sh, hr, cm
+            break
+    if ws is None:
+        raise ValueError("엑셀의 어느 시트에서도 '날짜(일자) / 번호(학번) / 출결(출결구분)' 머리글 행을 찾지 못했습니다.")
     merged = list(ws.merged_cells.ranges)
 
     def cell_value(r, c):
@@ -343,34 +374,16 @@ def read_attendance_excel(path: str, default_year: int) -> List[Record]:
                     return ws.cell(rg.min_row, rg.min_col).value
         return v
 
-    # (1) 머리글 행 자동 탐색: 날짜(일자) / 번호(학번) / 출결(출결구분)이 모두 있는 행
-    header_row, colmap = None, {}
-    for r in range(1, min(ws.max_row, 50) + 1):
-        cm = {}
-        for c in range(1, min(ws.max_column, 40) + 1):
-            h = norm(ws.cell(r, c).value)
-            key = HEADER_KEYS.get(h)
-            if not key and h and len(h) <= 10:              # '해당교시', '결석사유' 같은 머리글도 인식
-                if "교시" in h:
-                    key = "period"
-                elif "사유" in h:
-                    key = "reason"
-            if key and key not in cm:
-                cm[key] = c
-        if {"date", "num", "status"} <= cm.keys():
-            header_row, colmap = r, cm
-            break
-    if not header_row:
-        raise ValueError("엑셀에서 '일자(날짜) / 학번(번호) / 출결구분(출결)' 머리글 행을 찾지 못했습니다.")
-
     # 양식 판별: 상태분류 또는 시스템등록일시 열이 있으면 새 양식
     new_format = "category" in colmap or "sysdt" in colmap
 
     from openpyxl.utils import get_column_letter
     names = ({"date": "일자", "num": "학번", "period": "교시", "status": "출결구분",
               "category": "상태분류", "reason": "사유"} if new_format else
-             {"date": "날짜", "num": "번호", "name": "이름", "status": "출결", "reason": "사유", "period": "교시"})
-    LAST_EXCEL_INFO = (f"{'새 양식(교시별 행)' if new_format else '기존 양식'} / 머리글 {header_row}행 / " +
+             {"date": "날짜", "num": "번호", "name": "이름", "status": "출결", "reason": "사유",
+              "period": "교시", "note": "비고"})
+    LAST_EXCEL_INFO = (f"{'교시별 행 양식' if new_format else '담임확인서 양식(한 행=한 기록)'} / "
+                       f"시트 '{ws.title}' / 머리글 {header_row}행 / " +
                        ", ".join(f"{v}={get_column_letter(colmap[k]) + '열' if k in colmap else '없음!'}"
                                  for k, v in names.items()))
     if new_format and "reason" not in colmap:
@@ -458,9 +471,12 @@ def read_attendance_excel(path: str, default_year: int) -> List[Record]:
     # -----------------------------------------------------------------
     wb_formula = None
     for r in range(header_row + 1, ws.max_row + 1):
-        raw = {k: get(r, k) for k in ("date", "num", "name", "status", "reason", "period")}
+        raw = {k: get(r, k) for k in ("date", "num", "name", "status", "reason", "period", "note")}
         if all(cell_str(raw[k]) == "" for k in ("num", "name", "status", "reason")):
             continue                                            # 빈 행
+        # 사유 칸이 비어 있고 비고 칸에 적혀 있으면(예: 생리통, 현장체험학습) 비고를 사유로 사용
+        if not cell_str(raw["reason"]) and cell_str(raw["note"]):
+            raw["reason"] = raw["note"]
 
         # 교시 칸이 비어 보이면: 수식인데 계산값이 저장되지 않은 경우인지 확인
         if ext != ".csv" and "period" in colmap and cell_str(raw["period"]) == "":
