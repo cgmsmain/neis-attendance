@@ -1,5 +1,5 @@
 # 무설치(포터블) 버전 빌드 → GitHub 릴리즈에 zip 자동 첨부
-#  - 릴리즈를 '게시(Publish)'하면 자동 실행되어 NEIS_Attendance_RPA_<태그>.zip 을 그 릴리즈에 올림
+#  - 릴리즈를 '게시(Publish release)'하면 자동 실행 → NEIS_Attendance_RPA_<태그>.zip 을 그 릴리즈에 첨부
 #  - Actions 탭에서 수동 실행(Run workflow)하면 Artifacts 로만 올림(시험용)
 name: Build & Release
 
@@ -17,6 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # 필수 파일이 저장소 맨 위(루트)에 있는지 먼저 확인 → 없으면 원인을 알려 주고 중단
+      - name: Check files
+        shell: pwsh
+        run: |
+          Write-Host "== 저장소 파일 목록 =="
+          Get-ChildItem -Recurse -File | Where-Object { $_.FullName -notmatch '\\.git\\' } | ForEach-Object { $_.FullName.Replace((Get-Location).Path + '\', '') }
+          $missing = @()
+          foreach ($f in @('neis_attendance_rpa.py', 'requirements.txt')) { if (-not (Test-Path $f)) { $missing += $f } }
+          if ($missing.Count -gt 0) {
+            Write-Host "::error::저장소 맨 위에 다음 파일이 없습니다: $($missing -join ', ')"
+            exit 1
+          }
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
@@ -29,11 +42,13 @@ jobs:
       - name: Build
         run: python -m PyInstaller --noconfirm --onedir --noupx --windowed --name NEIS_Attendance_RPA --collect-all playwright neis_attendance_rpa.py
 
+      # 안내문·예시 양식은 저장소에 있을 때만 함께 넣음 (없어도 빌드는 계속)
       - name: Add guide and template
         shell: pwsh
         run: |
-          Copy-Item USAGE_KO.txt dist/NEIS_Attendance_RPA/
-          if (Test-Path sample_template.xlsx) { Copy-Item sample_template.xlsx dist/NEIS_Attendance_RPA/ }
+          foreach ($f in @('USAGE_KO.txt', 'sample_template.xlsx')) {
+            if (Test-Path $f) { Copy-Item $f dist/NEIS_Attendance_RPA/ } else { Write-Host "($f 없음 - 건너뜀)" }
+          }
 
       - name: Zip
         shell: pwsh
@@ -44,7 +59,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "NEIS_Attendance_RPA_${{ github.event.release.tag_name }}.zip" --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" "NEIS_Attendance_RPA_${{ github.event.release.tag_name }}.zip" --clobber --repo "${{ github.repository }}"
 
       - name: Upload artifact (manual run)
         if: github.event_name != 'release'
