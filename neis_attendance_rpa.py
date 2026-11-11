@@ -46,7 +46,7 @@ from playwright.sync_api import sync_playwright, Error as PWError
 # 0. 기본 설정값 (필요 시 여기만 조정)
 # =====================================================================
 APP_TITLE = "나이스 출결 자동 입력기"
-APP_VERSION = "v2.2 (담임확인서 양식)"     # 로그 첫 줄에 표시 → 어떤 버전으로 실행했는지 확인용
+APP_VERSION = "v2.3 (팝업 구분·종류 순서 자동 인식)"     # 로그 첫 줄에 표시 → 어떤 버전으로 실행했는지 확인용
 DEFAULT_PORT = 9222
 DEFAULT_URL = "https://gne.eduptl.kr/bpm_lgn_lg00_001.do"   # 프로그램 시작 시 기본 나이스 주소
 # 원격 제어용 브라우저 프로필 폴더 (브라우저별로 따로 사용)
@@ -975,6 +975,64 @@ t.el.setAttribute('data-rpa-calday', '1');
 return {ok: true, ym: [H.y, H.m]};
 """)
 
+# ---------- 출결마감구분 팝업: 항목 상태 확인 ----------
+# 팝업 영역(root) 안에서 글자(text)가 정확히 같은 항목을 찾아
+#   · 클릭 대상에 data-rpa-opt="1" 표시
+#   · 연결된 라디오의 선택(checked)·비활성(disabled) 상태를 돌려줌
+#     (<label for>, <label><input></label>, <input> 옆 글자, role="radio" 사용자 정의 라디오 모두 대응)
+POPUP_OPTION_JS = r"""(root, text) => {
+  const own = (el) => { let t = ''; for (const n of el.childNodes) if (n.nodeType === 3) t += n.textContent; return t.replace(/\s+/g, ''); };
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
+  root.querySelectorAll('[data-rpa-opt]').forEach(e => e.removeAttribute('data-rpa-opt'));
+  let label = null;
+  for (const el of root.querySelectorAll('*')) {
+    if (own(el) === text && vis(el)) { label = el; break; }
+  }
+  if (!label) return {found: false};
+  // 라디오 찾기
+  let radio = null;
+  const lab = label.closest('label');
+  if (lab && lab.htmlFor) radio = document.getElementById(lab.htmlFor);
+  if (!radio && lab) radio = lab.querySelector('input[type=radio], [role=radio]');
+  if (!radio) {
+    const prev = label.previousElementSibling, next = label.nextElementSibling;
+    for (const s of [prev, next]) if (s && s.matches && s.matches('input[type=radio], [role=radio]')) { radio = s; break; }
+  }
+  if (!radio) {
+    const p = label.parentElement;
+    const rs = p ? p.querySelectorAll('input[type=radio], [role=radio]') : [];
+    if (rs.length === 1) radio = rs[0];
+  }
+  if (!radio && label.closest('[role=radio]')) radio = label.closest('[role=radio]');
+  label.setAttribute('data-rpa-opt', '1');
+  if (radio) radio.setAttribute('data-rpa-opt-radio', '1');
+  const cls = (e) => (typeof e.className === 'string' ? e.className : '') + ' ' + ((e.parentElement && typeof e.parentElement.className === 'string') ? e.parentElement.className : '');
+  let checked = null, disabled = null;
+  if (radio) {
+    if (radio.tagName === 'INPUT') { checked = radio.checked; disabled = radio.disabled; }
+    else { checked = radio.getAttribute('aria-checked') === 'true'; disabled = radio.getAttribute('aria-disabled') === 'true'; }
+  }
+  if (disabled === null || disabled === false) {
+    if (/\bdisabled?\b/i.test(cls(label)) || getComputedStyle(label).pointerEvents === 'none') disabled = true;
+  }
+  return {found: true, known: radio !== null, checked, disabled: !!disabled,
+          tag: label.tagName.toLowerCase() + (radio ? '+' + radio.tagName.toLowerCase() : '')};
+}"""
+
+# 팝업 안 '구분'·'종류' 줄 이름의 위→아래 순서
+POPUP_ROW_ORDER_JS = r"""(root) => {
+  const own = (el) => { let t = ''; for (const n of el.childNodes) if (n.nodeType === 3) t += n.textContent; return t.replace(/\s+/g, ''); };
+  const pos = {};
+  for (const el of root.querySelectorAll('*')) {
+    const t = own(el);
+    if ((t === '구분' || t === '종류') && !(t in pos)) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) pos[t] = {y: r.top, x: r.left};
+    }
+  }
+  return Object.keys(pos).sort((a, b) => (pos[a].y - pos[b].y) || (pos[a].x - pos[b].x));
+}"""
+
 # 확인창의 '확인/예' 버튼 찾기
 #  - 확인창에는 제목 '확인'과 버튼 '확인'이 함께 있으므로, 제목이 아닌 '버튼'을 골라야 함
 #  - 점수: 버튼 태그/role(+3), 마우스 포인터 모양(+2), 제목 태그(-5) → 같으면 아래쪽 요소 우선
@@ -1222,19 +1280,65 @@ class NeisAutomator:
             pass
         time.sleep(0.5)
 
-    def click_choice(self, popup, text: str):
-        """팝업 안에서 라디오 항목(글자) 클릭."""
-        loc = popup.get_by_text(text, exact=True)
-        for i in range(loc.count()):
-            el = loc.nth(i)
-            if el.is_visible():
-                el.click(timeout=3000)
+    def option_state(self, popup, text: str) -> dict:
+        try:
+            return popup.evaluate(POPUP_OPTION_JS, text) or {"found": False}
+        except PWError:
+            return {"found": False}
+
+    def select_options(self, popup, rec: Record):
+        """
+        팝업에서 구분·종류를 선택.
+          · 팝업마다 '구분'과 '종류' 줄의 위아래 순서가 다를 수 있으므로, 화면에서 위에 있는 줄부터 선택
+          · 항목은 글자(질병, 지각 …)로 찾으므로 위치가 바뀌어도 찾을 수 있음
+          · 누를 때마다 실제로 선택됐는지 확인. 아직 비활성이면 다른 줄을 먼저 고른 뒤 다시 시도(최대 3바퀴)
+        """
+        wanted = [(row, text) for row, text in (("구분", rec.gubun), ("종류", rec.jongryu)) if text]
+        try:
+            order = popup.evaluate(POPUP_ROW_ORDER_JS) or []
+        except PWError:
+            order = []
+        if order:
+            wanted.sort(key=lambda w: order.index(w[0]) if w[0] in order else 9)
+            self.log(f"   [단계] 팝업 줄 순서: {' → '.join(order)}")
+
+        pending = wanted
+        for rnd in range(1, 4):
+            self.check_stop()
+            left = []
+            for row, text in pending:
+                st = self.option_state(popup, text)
+                if not st.get("found"):
+                    raise StepError(f"팝업에서 {row} '{text}' 항목을 찾지 못했습니다.")
+                if st.get("checked"):
+                    continue
+                if st.get("disabled"):
+                    self.log(f"   {row} '{text}'가 아직 비활성 상태라 다른 항목을 먼저 고릅니다.")
+                    left.append((row, text))
+                    continue
+                self.log(f"   [단계] 팝업 {row} 선택: {text}")
+                popup.locator('[data-rpa-opt="1"]').first.click(timeout=3000)
+                self.sleep("after_radio")
+                st2 = self.option_state(popup, text)
+                if st2.get("known") and not st2.get("checked"):
+                    # 글자를 눌러도 선택되지 않으면 라디오 자체를 눌러 봄
+                    radio = popup.locator('[data-rpa-opt-radio="1"]')
+                    if radio.count():
+                        try:
+                            radio.first.click(timeout=3000, force=True)
+                        except PWError:
+                            pass
+                        self.sleep("after_radio")
+                        st2 = self.option_state(popup, text)
+                    if not st2.get("checked"):
+                        left.append((row, text))
+            if not left:
                 return
-        lab = popup.get_by_label(text, exact=True)      # <label for> 연결 방식 대비
-        if lab.count():
-            lab.first.check(force=True, timeout=3000)
-            return
-        raise StepError(f"팝업에서 '{text}' 항목을 찾지 못했습니다.")
+            pending = left
+            # 남은 항목이 '이미 선택된 다른 항목' 때문에 막혔을 수 있으니, 다음 바퀴에서 순서를 뒤집어 시도
+            pending.reverse()
+        names = ", ".join(f"{r} '{t}'" for r, t in pending)
+        raise StepError(f"팝업에서 {names} 선택이 반영되지 않았습니다.")
 
     def fill_popup(self, rec: Record, found=None):
         """2번 사진 팝업: 구분 → 종류 → 사유 → 적용."""
@@ -1243,16 +1347,9 @@ class NeisAutomator:
             raise StepError("마감칸을 눌렀지만 출결마감구분 팝업이 뜨지 않았습니다.")
         _, popup = found
 
-        # 5-1. 구분 선택 (질병/미인정/기타/출석인정)
-        self.log(f"   [단계] 팝업 구분 선택: {rec.gubun}")
-        self.click_choice(popup, rec.gubun)
-        self.sleep("after_radio")                         # 종류 항목이 활성화될 시간
-
-        # 5-2. 종류 선택 (지각/조퇴/결석/결과)
-        if rec.jongryu:
-            self.log(f"   [단계] 팝업 종류 선택: {rec.jongryu}")
-            self.click_choice(popup, rec.jongryu)
-            self.sleep("after_radio")
+        # 5-1, 5-2. 구분(질병/미인정/기타/출석인정)·종류(지각/조퇴/결석/결과) 선택
+        #   팝업에 따라 두 줄의 위치가 바뀔 수 있으므로, 위쪽 줄부터 고르고 선택 여부를 확인
+        self.select_options(popup, rec)
 
         # 5-3. 사유 입력 (안전 입력: 클릭·키보드 없이 값만 설정)
         self.log("   [단계] 사유 입력")
