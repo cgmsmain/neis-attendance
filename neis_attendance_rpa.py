@@ -46,7 +46,7 @@ from playwright.sync_api import sync_playwright, Error as PWError
 # 0. 기본 설정값 (필요 시 여기만 조정)
 # =====================================================================
 APP_TITLE = "나이스 출결 자동 입력기"
-APP_VERSION = "v2.3 (팝업 구분·종류 순서 자동 인식)"     # 로그 첫 줄에 표시 → 어떤 버전으로 실행했는지 확인용
+APP_VERSION = "v2.4 (여러 날짜 처리 보강)"     # 로그 첫 줄에 표시 → 어떤 버전으로 실행했는지 확인용
 DEFAULT_PORT = 9222
 DEFAULT_URL = "https://gne.eduptl.kr/bpm_lgn_lg00_001.do"   # 프로그램 시작 시 기본 나이스 주소
 # 원격 제어용 브라우저 프로필 폴더 (브라우저별로 따로 사용)
@@ -1573,15 +1573,32 @@ class NeisAutomator:
         return True
 
     def close_calendar_if_open(self):
-        """달력이 열려 있으면 화면 제목 쪽 빈 곳을 클릭해 닫음."""
+        """
+        달력이 열려 있으면 닫음.
+        (예전: 화면 왼쪽 위 (5,5)를 클릭 → 나이스 상단 메뉴·로고를 눌러 화면이 바뀔 위험이 있어 제거)
+          ① 달력 바깥을 눌렀다는 신호(mousedown/click)를 문서에 보냄
+          ② 그래도 열려 있으면 달력 아이콘을 한 번 더 눌러 닫음
+        """
         cf, st = self.find_calendar()
         if not st:
             return
         try:
-            self.page.mouse.click(5, 5)
-            time.sleep(0.3)
+            cf.evaluate("""() => { for (const ty of ['mousedown', 'mouseup', 'click'])
+                document.body.dispatchEvent(new MouseEvent(ty, {bubbles: true, cancelable: true, view: window})); }""")
         except PWError:
             pass
+        time.sleep(0.3)
+        cf, st = self.find_calendar()
+        if st and self.date_frame is not None:
+            try:
+                icon = self.date_frame.locator('[data-rpa-calicon="0"]')
+                if icon.count():
+                    icon.first.click(timeout=2000)
+                    time.sleep(0.3)
+            except PWError:
+                pass
+        cf, st = self.find_calendar()
+        self.log("   달력을 닫았습니다." if not st else "   ※ 달력이 닫히지 않았습니다.")
 
     def go_to_date(self, d: date):
         """
@@ -1924,10 +1941,11 @@ class NeisAutomator:
     # ---------- 전체 실행 ----------
     def run(self, records: List[Record]):
         groups: "OrderedDict[date, List[Record]]" = OrderedDict()
-        for r in records:
+        for r in sorted(records, key=lambda r: r.date):          # 날짜를 오래된 순으로
             groups.setdefault(r.date, []).append(r)
+        self.log(f"처리할 날짜 {len(groups)}개: " + ", ".join(f"{d:%m.%d}({len(v)}건)" for d, v in groups.items()))
 
-        for d, recs in groups.items():
+        for gi, (d, recs) in enumerate(groups.items()):
             self.check_stop()
             self.log(f"===== {d:%Y.%m.%d} ({len(recs)}건) =====")
             try:
@@ -1963,6 +1981,10 @@ class NeisAutomator:
                     self.screenshot(f"row{rec.row}")
                     self.close_popup_if_open()
 
+            if (not self.opts["auto_save"] and not self.opts["test_mode"] and ok
+                    and gi < len(groups) - 1):
+                self.log("   ※ 저장하지 않고 다음 날짜로 이동합니다. 나이스에서 이 날짜의 입력 내용이 "
+                         "사라지거나 이동이 막힐 수 있습니다. ('날짜별 [저장] 자동 클릭' 옵션 권장)")
             if self.opts["auto_save"] and not self.opts["test_mode"] and ok:
                 self.save_current()
 
@@ -2121,6 +2143,15 @@ class App(tk.Tk):
         if recs is None:
             return
         valid = [r for r in recs if r.result != "엑셀오류"]
+        dates = sorted({r.date for r in valid if r.date})
+        if len(dates) > 1 and not self.v_test.get() and not self.v_save.get():
+            if messagebox.askyesno(APP_TITLE,
+                                   f"엑셀에 날짜가 {len(dates)}개 있습니다 "
+                                   f"({', '.join(d.strftime('%m.%d') for d in dates)}).\n\n"
+                                   "나이스는 다른 날짜로 이동하기 전에 저장해야 입력 내용이 유지됩니다.\n"
+                                   "'날짜별 [저장] 자동 클릭'을 켜고 진행할까요?\n\n"
+                                   "(아니요를 누르면 저장 없이 진행합니다)"):
+                self.v_save.set(True)
         mode = "테스트 모드(적용 안 함)" if self.v_test.get() else "실제 입력"
         if not messagebox.askyesno(APP_TITLE, f"{len(valid)}건을 {mode}로 진행합니다.\n"
                                               f"(엑셀 오류 {len(recs) - len(valid)}건 제외)\n\n진행할까요?"):
